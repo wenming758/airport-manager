@@ -1505,7 +1505,7 @@ def _on_update_result(win, payload, err, manual=False):
         except Exception:
             pass
         try:
-            win.status.setText("☁️ 已在浏览器打开 v%s 的下载地址" % tag)
+            win.status.setText("☁️ 已在浏览器打开 %s 的下载地址" % tag)
         except Exception:
             pass
     else:
