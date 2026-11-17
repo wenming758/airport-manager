@@ -13,6 +13,7 @@
    每条链接默认直连，直连失败（超时/连接被重置/SSL 等）时自动改用代理重试；
    记住每条链接是否必须先走代理，下次检测直接优先用代理，避免反复超时。
 5) 检测成功后自动解除「已失效」标记（恢复原分组）。
+6) 检测更新 —— 比对 Gitee 项目 Releases 上的最新版本号，默认启动时自动检测。
 
 此外还修掉了原程序自身导致「检测不成功」的两个缺陷（不改界面）：
   a) 订阅里 expire 时间戳过大（如 3126 年）时 datetime.fromtimestamp 会抛
@@ -26,10 +27,12 @@ import functools
 import json
 import re
 import threading
+import webbrowser
 
-from PySide6.QtCore import QCollator, QLocale, Qt, QTimer, Signal
+from PySide6.QtCore import QCollator, QLocale, QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -54,6 +57,11 @@ from PySide6.QtWidgets import (
 
 INVALID_GROUP = "失效链接"      # 系统保留分组：存放被标记为“失效”的订阅
 DEFAULT_GROUP = "默认分组"      # 与原生逻辑一致的回退分组名
+
+APP_VERSION = "1.1.0"
+UPDATE_API = ("https://gitee.com/api/v5/repos/wenming760/"
+              "airport-manager/releases/latest")
+UPDATE_PAGE = "https://gitee.com/wenming760/airport-manager/releases"
 
 SORT_MODES = ["默认排序", "名称", "已失效优先", "正常优先", "添加时间", "流量大小"]
 SORT_HINTS = {
@@ -1069,8 +1077,29 @@ def _install_proxy_row(self, w):
     self.lbl_proxy.setStyleSheet("font-size:10px;color:#7a8899;")
     lay.addWidget(self.lbl_proxy, lay.rowCount(), 0, 1, 3)
 
+    upd_row = QWidget()
+    hu = QHBoxLayout(upd_row)
+    hu.setContentsMargins(0, 2, 0, 0)
+    hu.setSpacing(6)
+    self.cb_auto_update = QCheckBox("☁️ 自动检测更新")
+    self.cb_auto_update.setCursor(Qt.PointingHandCursor)
+    self.cb_auto_update.setStyleSheet("QCheckBox{font-size:11px;color:#44505c;}")
+    self.cb_auto_update.setToolTip("启动时自动检查 Gitee 上的最新版本（默认开启）")
+    self.cb_auto_update.setChecked(_update_enabled(self))
+    self.btn_update_now = QPushButton("检测更新")
+    self.btn_update_now.setFixedHeight(22)
+    self.btn_update_now.setStyleSheet("QPushButton{font-size:11px;padding:0 8px;}")
+    self.btn_update_now.setCursor(Qt.PointingHandCursor)
+    self.btn_update_now.setToolTip("立即检查 Gitee 上是否有新版本")
+    hu.addWidget(self.cb_auto_update)
+    hu.addStretch(1)
+    hu.addWidget(self.btn_update_now)
+    lay.addWidget(upd_row, lay.rowCount(), 0, 1, 3)
+
     self.btn_proxy_full.clicked.connect(self.open_proxy)
     self.btn_proxy_off.clicked.connect(self.disable_proxy)
+    self.cb_auto_update.toggled.connect(self._set_auto_update)
+    self.btn_update_now.clicked.connect(self.check_updates)
 
 
 def _apply_proxy(self):
@@ -1290,11 +1319,14 @@ def _install_ui(self):
         acts = menu.actions()
         anchor = acts[-1] if acts else None
         sep = menu.addSeparator()
+        act_upd = QAction("☁️ 检测更新…", menu)
+        act_upd.triggered.connect(lambda _=False, w=self: _check_updates(w))
+        sep2 = menu.addSeparator()
         act = QAction("🗂️ 分组管理…", menu)
         act.triggered.connect(lambda _=False, w=self: _open_group_manager(w))
         if anchor is not None:
-            menu.insertAction(anchor, sep)
-            menu.insertAction(anchor, act)
+            for a in (sep, act_upd, sep2, act):
+                menu.insertAction(anchor, a)
         break
 
     gl = self.group_list
@@ -1311,6 +1343,203 @@ def _group_context_menu(self, pos):
     menu.addSeparator()
     menu.addAction("🗂️ 分组管理…", lambda: _open_group_manager(self))
     menu.exec(self.group_list.mapToGlobal(pos))
+
+
+# --------------------------------------------------------------------------
+# 检测更新（更新源：Gitee 项目的 Releases）
+# --------------------------------------------------------------------------
+def _version_tuple(text):
+    """'v1.2.3' / '1.2.3-beta' -> (1, 2, 3)。"""
+    nums = re.findall(r"\d+", str(text or ""))
+    out = [int(n) for n in nums[:4]]
+    while len(out) < 3:
+        out.append(0)
+    return tuple(out)
+
+
+def _update_enabled(win):
+    try:
+        return bool((win.data.get("settings") or {}).get("auto_update", True))
+    except Exception:
+        return True
+
+
+class _UpdateBridge(QObject):
+    """跨线程回传检测结果；信号自动排队到界面线程。"""
+
+    finished = Signal(object, str)
+
+    def __init__(self, win, manual):
+        super().__init__(win)
+        self.win = win
+        self.manual = manual
+        self.finished.connect(self._handle)
+
+    def _handle(self, payload, err):
+        _on_update_result(self.win, payload, err, self.manual)
+
+
+def _fetch_latest_release():
+    req = _REAL_REQUESTS
+    if req is None:
+        import requests as req
+    sess = req.Session()
+    sess.trust_env = False
+    headers = {"User-Agent": "airport-manager/%s" % APP_VERSION}
+    try:
+        resp = sess.get(UPDATE_API, timeout=10, headers=headers)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        proxies = _CTX.get("proxy_map") or {}
+        if not proxies:
+            raise
+        resp = sess.get(UPDATE_API, timeout=10, headers=headers,
+                        proxies=proxies)
+        resp.raise_for_status()
+        return resp.json()
+
+
+def _update_worker(bridge):
+    try:
+        bridge.finished.emit(_fetch_latest_release(), "")
+    except Exception as exc:
+        bridge.finished.emit(None, "%s" % (exc or exc.__class__.__name__))
+
+
+def _start_update_check(win, manual=False):
+    if getattr(win, "_upd_busy", False):
+        if manual:
+            try:
+                win.status.setText("☁️ 正在检测更新，请稍候…")
+            except Exception:
+                pass
+        return
+    win._upd_busy = True
+    if manual:
+        try:
+            win.status.setText("☁️ 正在检测更新…（更新源：Gitee）")
+        except Exception:
+            pass
+    bridge = _UpdateBridge(win, manual)
+    win._upd_bridge = bridge  # 防止被回收
+    threading.Thread(target=_update_worker, args=(bridge,), daemon=True).start()
+
+
+def _release_notes(body, limit=600):
+    text = re.sub(r"\r\n?", "\n", str(body or "")).strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    if len(text) > limit:
+        text = text[:limit].rstrip() + "…"
+    return text
+
+
+def _on_update_result(win, payload, err, manual=False):
+    win._upd_busy = False
+    win._upd_bridge = None
+    if err or not isinstance(payload, dict):
+        try:
+            win.status.setText("☁️ 检测更新失败：%s" % (err or "返回数据异常"))
+        except Exception:
+            pass
+        if manual:
+            QMessageBox.warning(
+                win, "☁️ 检测更新",
+                "没能连上 Gitee 更新源，请稍后再试。\n\n%s\n\n"
+                "也可以手动打开下载页：\n%s" % (err or "", UPDATE_PAGE))
+        return
+
+    tag = str(payload.get("tag_name") or "").strip()
+    latest = _version_tuple(tag)
+    current = _version_tuple(APP_VERSION)
+    if not tag or latest <= current:
+        try:
+            win.status.setText("✅ 已是最新版本 v%s" % APP_VERSION)
+        except Exception:
+            pass
+        if manual:
+            _msg(win, "当前版本 v%s，已是最新版本。\n\n"
+                      "更新源：Gitee Releases\n%s" % (APP_VERSION, UPDATE_PAGE),
+                 "☁️ 检测更新")
+        return
+
+    skipped = None
+    try:
+        skipped = (win.data.get("settings") or {}).get("update_skip")
+    except Exception:
+        pass
+    if not manual and skipped == tag:
+        try:
+            win.status.setText("☁️ 发现新版本 %s（已选择稍后提醒）" % tag)
+        except Exception:
+            pass
+        return
+
+    exe_url = ""
+    for a in payload.get("assets") or []:
+        if str(a.get("name") or "").lower().endswith(".exe"):
+            exe_url = str(a.get("browser_download_url") or "")
+            break
+    page = str(payload.get("html_url") or exe_url or UPDATE_PAGE)
+
+    box = QMessageBox(win)
+    box.setWindowTitle("☁️ 发现新版本")
+    box.setIcon(QMessageBox.Information)
+    title = str(payload.get("name") or tag).strip()
+    lines = ["发现新版本 %s（当前 v%s）" % (tag, APP_VERSION)]
+    if title and title != tag:
+        lines.append(title)
+    notes = _release_notes(payload.get("body"))
+    if notes:
+        lines += ["", notes]
+    lines += ["", "更新源：Gitee · %s" % UPDATE_PAGE]
+    box.setText("\n".join(lines))
+    go = box.addButton("⬇️ 去下载", QMessageBox.AcceptRole)
+    box.addButton("稍后提醒", QMessageBox.RejectRole)
+    box.setDefaultButton(go)
+    box.exec()
+
+    if box.clickedButton() is go:
+        try:
+            webbrowser.open(exe_url or page)
+        except Exception:
+            pass
+        try:
+            win.status.setText("☁️ 已在浏览器打开 v%s 的下载地址" % tag)
+        except Exception:
+            pass
+    else:
+        try:
+            win.data.setdefault("settings", {})["update_skip"] = tag
+            _CTX["store"].save(win.data)
+        except Exception:
+            pass
+        try:
+            win.status.setText("☁️ 已忽略 %s 的提醒，可在 ⚙ 菜单手动检测" % tag)
+        except Exception:
+            pass
+
+
+def _maybe_auto_check(win):
+    if _update_enabled(win):
+        _start_update_check(win, manual=False)
+
+
+def _set_auto_update(self, checked):
+    try:
+        self.data.setdefault("settings", {})["auto_update"] = bool(checked)
+        _CTX["store"].save(self.data)
+    except Exception:
+        pass
+    if checked:
+        self.status.setText("☁️ 已开启自动检测更新：启动时检查 Gitee 最新版本")
+        QTimer.singleShot(300, lambda w=self: _start_update_check(w, False))
+    else:
+        self.status.setText("☁️ 已关闭自动检测更新（仍可手动检测）")
+
+
+def _check_updates(self):
+    _start_update_check(self, manual=True)
 
 
 def install(cards, store, proxy, checker, main):
@@ -1336,6 +1565,8 @@ def install(cards, store, proxy, checker, main):
     MW._set_invalid = _set_invalid
     MW._toggle_selected = _toggle_selected
     MW._on_sort_changed = _on_sort_changed
+    MW._set_auto_update = _set_auto_update
+    MW.check_updates = _check_updates
 
     _orig_init = MW.__init__
     _orig_build_left = MW._build_left
@@ -1373,6 +1604,8 @@ def install(cards, store, proxy, checker, main):
                                              _sync_detail_heights(w)))
         _sync_proxy_ui(self)
         _sync_invalid_btn(self)
+        if _update_enabled(self):
+            QTimer.singleShot(1600, lambda w=self: _maybe_auto_check(w))
 
     def _build_left(self):
         w = _orig_build_left(self)
