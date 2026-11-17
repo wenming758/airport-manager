@@ -1,0 +1,20 @@
+# 订阅数据（含账号/链接，绝不入库）
+data/
+patchbuild/data/
+patchbuild/orig/data/
+
+# 测试与构建产物
+_tools/
+_chk/
+build/
+src/
+patchbuild/build/
+patchbuild/dist/
+__pycache__/
+*.pyo
+*.log
+
+# 历史版本/原版备份（仅保留 Release 附件）
+机场链接管理器.exe
+机场链接管理器_上一版.exe
+机场链接管理器_原版备份.exe
